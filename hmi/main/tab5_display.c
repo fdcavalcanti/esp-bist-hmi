@@ -119,7 +119,8 @@ static esp_err_t st7121_panel_new(esp_lcd_panel_handle_t *ret_panel, esp_lcd_pan
         .virtual_channel = 0,
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = ST7121_DPI_CLOCK_MHZ,
-        .pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565,
+        .in_color_format = LCD_COLOR_FMT_RGB565,
+        .out_color_format = LCD_COLOR_FMT_RGB565,
         .num_fbs = 1,
         .video_timing = {
             .h_size = BSP_LCD_H_RES,
@@ -131,7 +132,6 @@ static esp_err_t st7121_panel_new(esp_lcd_panel_handle_t *ret_panel, esp_lcd_pan
             .vsync_back_porch = 24,
             .vsync_front_porch = 200,
         },
-        .flags.use_dma2d = true,
     };
 
     st7121_vendor_config_t vendor_config = {
@@ -152,6 +152,7 @@ static esp_err_t st7121_panel_new(esp_lcd_panel_handle_t *ret_panel, esp_lcd_pan
     };
 
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7121(*ret_io, &panel_config, ret_panel), TAG, "New ST7121 panel failed");
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_enable_dma2d(*ret_panel), TAG, "DPI DMA2D enable failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(*ret_panel), TAG, "Panel reset failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(*ret_panel), TAG, "Panel init failed");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(*ret_panel, true), TAG, "Panel display on failed");

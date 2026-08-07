@@ -1,13 +1,9 @@
 ## IDF Component Manager Manifest File
 dependencies:
   idf:
-    version: '>=5.4.0'
+    version: '=6.0'
   espressif/m5stack_tab5: ^1.2.0
+  # Pin the release covered by the IDF 6.0 compatibility shim in CMakeLists.txt.
+  espressif/esp_lvgl_port: '=2.9.0'
   # Tab5 boards fitted with an ST7121 panel are not covered by the BSP above.
   espressif/esp_lcd_st7121: ^1.0.1
-overrides:
-- usb:
-    with:
-      usb:
-        path: ../../../esp-idf/components/usb
-    reason: Use IDF 5.4.2 built-in USB instead of managed espressif/usb 1.4.x

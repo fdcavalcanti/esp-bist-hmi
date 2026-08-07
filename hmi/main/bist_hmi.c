@@ -1,23 +1,30 @@
+#include <inttypes.h>
 #include <stdio.h>
 
 #include "bsp/esp-bsp.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "lvgl.h"
+#include "hmi_ui.h"
 #include "serial_master.h"
 #include "tab5_display.h"
+#include "ulp_lp_core.h"
+#include "lp_core_uart.h"
+#include "bist_hd_agent.h"
+#include "bist_hd_protocol.h"
+
+#define MAILBOX_TIMEOUT_MS  10000
 
 static const char *TAG = "bist_hmi";
 
+extern const uint8_t ulp_idf_bist_sample_bin_start[] asm("_binary_ulp_idf_bist_sample_bin_start");
+extern const uint8_t ulp_idf_bist_sample_bin_end[] asm("_binary_ulp_idf_bist_sample_bin_end");
+
 static lv_display_t *s_disp;
-static lv_obj_t *s_target_speed_label;
-static lv_obj_t *s_motor_status_label;
-static lv_obj_t *s_overspeed_label;
 static QueueHandle_t s_command_queue;
-static uint16_t s_target_speed = 1000;
 
 typedef enum {
     MOTOR_COMMAND_SET_POWER,
@@ -29,6 +36,140 @@ typedef struct {
     uint16_t value;
 } motor_command_t;
 
+/*
+ * The Host Diagnostic Agent owns mailbox I/O on a high-priority worker
+ * (AGENT_READY, LP_STATUS drain, optional Q&A). This task only consumes
+ * queued LP status for the UI and must stay free of LVGL/Modbus work so
+ * post-boot / runtime results are reflected promptly.
+ */
+static volatile bool s_bist_post_boot_ok = false;
+static volatile bool s_bist_post_boot_done = false;
+static volatile bool s_bist_runtime_ok = false;
+static volatile bool s_hmi_halted = false;
+
+static void lp_uart_init(void)
+{
+    lp_core_uart_cfg_t cfg = LP_CORE_UART_DEFAULT_CONFIG();
+    cfg.uart_pin_cfg.tx_io_num = GPIO_NUM_2;
+    cfg.uart_pin_cfg.rx_io_num = GPIO_NUM_3;
+
+    ESP_ERROR_CHECK(lp_core_uart_init(&cfg));
+
+    ESP_LOGI(TAG, "LP UART initialized successfully");
+}
+
+static void lp_core_init(void)
+{
+    ulp_lp_core_cfg_t cfg = {
+        .wakeup_source = ULP_LP_CORE_WAKEUP_SOURCE_HP_CPU,
+    };
+
+    /* An HP-only reset leaves the LP core running: stop it so the companion
+     * restarts from scratch instead of racing the new agent handshake. */
+    ulp_lp_core_stop();
+
+    ESP_ERROR_CHECK(ulp_lp_core_load_binary(ulp_idf_bist_sample_bin_start,
+                    (ulp_idf_bist_sample_bin_end - ulp_idf_bist_sample_bin_start)));
+
+    ESP_ERROR_CHECK(ulp_lp_core_run(&cfg));
+
+    ESP_LOGI(TAG, "LP core loaded with firmware and running successfully");
+}
+
+static void print_postboot_results(uint32_t result)
+{
+    printf("=== Post-boot BIST results ===\n");
+    printf("test_BIST_cpu_reg:%s\n",     (result & BIST_HD_BIT_CPU_REG) ? "PASS" : "FAIL");
+    printf("test_BIST_cpu_csr:%s\n",     (result & BIST_HD_BIT_CPU_CSR) ? "PASS" : "FAIL");
+    printf("test_BIST_ram_march_x:%s\n", (result & BIST_HD_BIT_RAM_X)  ? "PASS" : "FAIL");
+    printf("test_BIST_ram_abraham:%s\n", (result & BIST_HD_BIT_ABRAHAM) ? "PASS" : "FAIL");
+    printf("test_BIST_flash_crc:%s\n",   (result & BIST_HD_BIT_FLASH)  ? "PASS" : "FAIL");
+}
+
+static void print_runtime_results(uint32_t result)
+{
+    printf("=== Runtime BIST results ===\n");
+    printf("test_BIST_runtime_cpu_reg:%s\n",      (result & BIST_HD_BIT_CPU_REG) ? "PASS" : "FAIL");
+    printf("test_BIST_runtime_cpu_csr:%s\n",      (result & BIST_HD_BIT_CPU_CSR) ? "PASS" : "FAIL");
+    printf("test_BIST_runtime_ram_march_a:%s\n",  (result & BIST_HD_BIT_RAM_A)   ? "PASS" : "FAIL");
+    printf("test_BIST_runtime_ram_abraham:%s\n",  (result & BIST_HD_BIT_ABRAHAM) ? "PASS" : "FAIL");
+    printf("test_BIST_runtime_stack_check:%s\n",  (result & BIST_HD_BIT_STACK)   ? "PASS" : "FAIL");
+}
+
+static void update_bist_runtime_status(void)
+{
+    bsp_display_lock(0);
+    hmi_ui_set_bist_runtime(s_bist_runtime_ok);
+    bsp_display_unlock();
+}
+
+static void update_bist_postboot_status(void)
+{
+    bsp_display_lock(0);
+    hmi_ui_set_bist_postboot(s_bist_post_boot_ok);
+    bsp_display_unlock();
+}
+
+/*
+ * Runs on the main (UI) task after the status task flags a runtime failure.
+ * Puts the motor in a safe state and marks the UI as stopped. Mailbox I/O
+ * stays with the Host Diagnostic Agent worker.
+ */
+static void enter_hmi_safe_state(void)
+{
+    ESP_LOGE(TAG, "Runtime BIST failed — stopping HMI");
+
+    /* Best-effort safe state: cut motor power and ignore further UI commands. */
+    (void)master_write_u8(CID_MOTOR_ON_OFF, 0);
+    if (s_command_queue) {
+        xQueueReset(s_command_queue);
+    }
+
+    bsp_display_lock(0);
+    hmi_ui_set_halted();
+    bsp_display_unlock();
+}
+
+/*
+ * Consumes LP_STATUS words queued by the Host Diagnostic Agent worker.
+ * Post-boot is one-shot; runtime status is polled forever for the UI.
+ */
+static void bist_status_task(void *arg)
+{
+    (void)arg;
+    uint32_t status;
+    int err;
+
+    err = bist_hd_agent_wait_lp_status(&status, BIST_HD_BIT_POSTBOOT, MAILBOX_TIMEOUT_MS);
+    if (err == 0) {
+        print_postboot_results(status);
+        s_bist_post_boot_ok = (status & BIST_HD_POSTBOOT_ALL_PASS) == BIST_HD_POSTBOOT_ALL_PASS;
+    } else {
+        ESP_LOGE(TAG, "BIST post-boot wait failed: %d", err);
+        s_bist_post_boot_ok = false;
+    }
+    s_bist_post_boot_done = true;
+
+    ESP_LOGI(TAG, "BIST post-boot done");
+
+    for (;;) {
+        err = bist_hd_agent_wait_lp_status(&status, BIST_HD_BIT_RUNTIME, MAILBOX_TIMEOUT_MS);
+        if (err != 0) {
+            ESP_LOGE(TAG, "BIST runtime wait failed: %d", err);
+            s_bist_runtime_ok = false;
+            s_hmi_halted = true;
+            continue;
+        }
+
+        bool pass = (status & BIST_HD_RUNTIME_ALL_PASS) == BIST_HD_RUNTIME_ALL_PASS;
+        s_bist_runtime_ok = pass;
+        if (!pass) {
+            print_runtime_results(status);
+            s_hmi_halted = true;
+        }
+    }
+}
+
 static void queue_motor_command(motor_command_type_t type, uint16_t value)
 {
     const motor_command_t command = {
@@ -36,137 +177,31 @@ static void queue_motor_command(motor_command_type_t type, uint16_t value)
         .value = value,
     };
 
+    if (s_hmi_halted) {
+        ESP_LOGW(TAG, "Ignoring motor command — HMI halted");
+        return;
+    }
+
+    if (s_command_queue == NULL) {
+        ESP_LOGW(TAG, "Ignoring motor command — queue not ready");
+        return;
+    }
+
     if (xQueueSend(s_command_queue, &command, 0) != pdTRUE) {
         ESP_LOGW(TAG, "Motor command queue is full");
     }
 }
 
-static void power_button_event_cb(lv_event_t *event)
+static void on_ui_power(bool power_on, void *user_data)
 {
-    const uint16_t power_on = (uint16_t)(uintptr_t)lv_event_get_user_data(event);
-    queue_motor_command(MOTOR_COMMAND_SET_POWER, power_on);
+    (void)user_data;
+    queue_motor_command(MOTOR_COMMAND_SET_POWER, power_on ? 1 : 0);
 }
 
-static void speed_button_event_cb(lv_event_t *event)
+static void on_ui_speed(uint16_t target_speed_rpm, void *user_data)
 {
-    const int32_t direction = (int32_t)(intptr_t)lv_event_get_user_data(event);
-
-    if (direction > 0 && s_target_speed <= UINT16_MAX - 100) {
-        s_target_speed += 100;
-    } else if (direction < 0 && s_target_speed >= 100) {
-        s_target_speed -= 100;
-    } else {
-        return;
-    }
-
-    lv_label_set_text_fmt(s_target_speed_label, "%u RPM", (unsigned)s_target_speed);
-    queue_motor_command(MOTOR_COMMAND_SET_SPEED, s_target_speed);
-}
-
-static lv_obj_t *create_button(lv_obj_t *parent, const char *text, uint32_t color,
-                               lv_event_cb_t event_cb, void *user_data)
-{
-    lv_obj_t *button = lv_button_create(parent);
-    lv_obj_set_flex_grow(button, 1);
-    lv_obj_set_height(button, LV_PCT(100));
-    lv_obj_set_style_bg_color(button, lv_color_hex(color), 0);
-    lv_obj_set_style_radius(button, 12, 0);
-    lv_obj_add_event_cb(button, event_cb, LV_EVENT_CLICKED, user_data);
-
-    lv_obj_t *label = lv_label_create(button);
-    lv_label_set_text(label, text);
-    lv_obj_set_style_text_color(label, lv_color_white(), 0);
-    lv_obj_center(label);
-    return button;
-}
-
-static void create_ui(lv_obj_t *screen)
-{
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x101820), 0);
-    lv_obj_set_style_pad_all(screen, 20, 0);
-    lv_obj_set_style_pad_gap(screen, 16, 0);
-    lv_obj_set_flex_flow(screen, LV_FLEX_FLOW_COLUMN);
-
-    lv_obj_t *title = lv_label_create(screen);
-    lv_label_set_text(title, "MOTOR CONTROL HMI (BIST)");
-    lv_obj_set_width(title, LV_PCT(100));
-    lv_obj_set_style_text_color(title, lv_color_hex(0xE8EEF4), 0);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
-
-    lv_obj_t *power_row = lv_obj_create(screen);
-    lv_obj_remove_style_all(power_row);
-    lv_obj_set_width(power_row, LV_PCT(100));
-    lv_obj_set_height(power_row, 90);
-    lv_obj_set_style_pad_gap(power_row, 16, 0);
-    lv_obj_set_flex_flow(power_row, LV_FLEX_FLOW_ROW);
-    create_button(power_row, "ON", 0x168A45, power_button_event_cb, (void *)(uintptr_t)1);
-    create_button(power_row, "OFF", 0xB3261E, power_button_event_cb, (void *)(uintptr_t)0);
-
-    lv_obj_t *speed_panel = lv_obj_create(screen);
-    lv_obj_set_width(speed_panel, LV_PCT(100));
-    lv_obj_set_height(speed_panel, 150);
-    lv_obj_set_style_bg_color(speed_panel, lv_color_hex(0x1B2A34), 0);
-    lv_obj_set_style_border_width(speed_panel, 0, 0);
-    lv_obj_set_style_radius(speed_panel, 12, 0);
-    lv_obj_set_style_pad_all(speed_panel, 12, 0);
-    lv_obj_set_style_pad_gap(speed_panel, 8, 0);
-    lv_obj_set_flex_flow(speed_panel, LV_FLEX_FLOW_COLUMN);
-
-    lv_obj_t *speed_title = lv_label_create(speed_panel);
-    lv_label_set_text(speed_title, "TARGET SPEED (100 RPM STEPS)");
-    lv_obj_set_width(speed_title, LV_PCT(100));
-    lv_obj_set_style_text_color(speed_title, lv_color_hex(0xAFC6D4), 0);
-    lv_obj_set_style_text_align(speed_title, LV_TEXT_ALIGN_CENTER, 0);
-
-    lv_obj_t *selector_row = lv_obj_create(speed_panel);
-    lv_obj_remove_style_all(selector_row);
-    lv_obj_set_width(selector_row, LV_PCT(100));
-    lv_obj_set_flex_grow(selector_row, 1);
-    lv_obj_set_style_pad_gap(selector_row, 10, 0);
-    lv_obj_set_flex_flow(selector_row, LV_FLEX_FLOW_ROW);
-
-    create_button(selector_row, "-", 0x315B72, speed_button_event_cb, (void *)(intptr_t)-1);
-    s_target_speed_label = lv_label_create(selector_row);
-    lv_label_set_text_fmt(s_target_speed_label, "%u RPM", (unsigned)s_target_speed);
-    lv_obj_set_flex_grow(s_target_speed_label, 2);
-    lv_obj_set_height(s_target_speed_label, LV_PCT(100));
-    lv_obj_set_style_text_color(s_target_speed_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_align(s_target_speed_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_pad_top(s_target_speed_label, 22, 0);
-    create_button(selector_row, "+", 0x315B72, speed_button_event_cb, (void *)(intptr_t)1);
-
-    s_motor_status_label = lv_label_create(screen);
-    lv_label_set_text(s_motor_status_label, "ACTUAL SPEED: -- RPM\nMOTOR TEMPERATURE: -- C");
-    lv_obj_set_width(s_motor_status_label, LV_PCT(100));
-    lv_obj_set_flex_grow(s_motor_status_label, 1);
-    lv_obj_set_style_bg_color(s_motor_status_label, lv_color_hex(0x1B2A34), 0);
-    lv_obj_set_style_bg_opa(s_motor_status_label, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_motor_status_label, 12, 0);
-    lv_obj_set_style_pad_all(s_motor_status_label, 20, 0);
-    lv_obj_set_style_text_color(s_motor_status_label, lv_color_hex(0xE8EEF4), 0);
-    lv_obj_set_style_text_align(s_motor_status_label, LV_TEXT_ALIGN_CENTER, 0);
-
-    lv_obj_t *bist_status_label = lv_label_create(screen);
-    lv_label_set_text(bist_status_label, "BIST STATUS: NOT READY");
-    lv_obj_set_width(bist_status_label, LV_PCT(100));
-    lv_obj_set_height(bist_status_label, 70);
-    lv_obj_set_style_bg_color(bist_status_label, lv_color_hex(0xC62828), 0);
-    lv_obj_set_style_bg_opa(bist_status_label, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(bist_status_label, 12, 0);
-    lv_obj_set_style_pad_top(bist_status_label, 24, 0);
-    lv_obj_set_style_text_color(bist_status_label, lv_color_white(), 0);
-    lv_obj_set_style_text_align(bist_status_label, LV_TEXT_ALIGN_CENTER, 0);
-
-    s_overspeed_label = lv_label_create(screen);
-    lv_label_set_text(s_overspeed_label, "OVERSPEED ALARM: --");
-    lv_obj_set_width(s_overspeed_label, LV_PCT(100));
-    lv_obj_set_height(s_overspeed_label, 70);
-    lv_obj_set_style_bg_color(s_overspeed_label, lv_color_hex(0x59636A), 0);
-    lv_obj_set_style_bg_opa(s_overspeed_label, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_overspeed_label, 12, 0);
-    lv_obj_set_style_pad_top(s_overspeed_label, 24, 0);
-    lv_obj_set_style_text_color(s_overspeed_label, lv_color_white(), 0);
-    lv_obj_set_style_text_align(s_overspeed_label, LV_TEXT_ALIGN_CENTER, 0);
+    (void)user_data;
+    queue_motor_command(MOTOR_COMMAND_SET_SPEED, target_speed_rpm);
 }
 
 static esp_err_t display_init(void)
@@ -177,49 +212,55 @@ static esp_err_t display_init(void)
     bsp_display_rotate(s_disp, LV_DISPLAY_ROTATION_90);
     ESP_ERROR_CHECK(bsp_display_backlight_on());
 
+    const hmi_ui_ops_t ui_ops = {
+        .on_power = on_ui_power,
+        .on_speed = on_ui_speed,
+        .user_data = NULL,
+        .initial_target_speed = 1000,
+    };
+
     bsp_display_lock(0);
-    lv_obj_t *scr = lv_display_get_screen_active(s_disp);
-    create_ui(scr);
+    hmi_ui_create(lv_display_get_screen_active(s_disp), &ui_ops);
     bsp_display_unlock();
 
     ESP_LOGI(TAG, "Display ready");
     return ESP_OK;
 }
 
-static void update_motor_status(void)
+static void update_motor_status(bool init)
 {
     uint8_t motor_on = 0;
     uint16_t current_speed = 0;
     uint16_t temperature = 0;
     uint8_t overspeed_alarm = 0;
+    uint16_t speed_setpoint = 0;
 
     if (master_read_u8(CID_MOTOR_ON_OFF, &motor_on) != ESP_OK ||
         master_read_u16(CID_MOTOR_CURRENT_SPEED, &current_speed) != ESP_OK ||
         master_read_u16(CID_MOTOR_TEMPERATURE, &temperature) != ESP_OK ||
-        master_read_u8(CID_OVERSPEED_ALARM, &overspeed_alarm) != ESP_OK) {
+        master_read_u8(CID_OVERSPEED_ALARM, &overspeed_alarm) != ESP_OK ||
+        master_read_u16(CID_MOTOR_SPEED_SETPOINT, &speed_setpoint) != ESP_OK) {
         ESP_LOGE(TAG, "Could not read complete motor status");
         bsp_display_lock(0);
-        lv_label_set_text(s_motor_status_label, "MOTOR COMMUNICATION UNAVAILABLE");
-        lv_label_set_text(s_overspeed_label, "OVERSPEED ALARM: UNKNOWN");
-        lv_obj_set_style_bg_color(s_overspeed_label, lv_color_hex(0x59636A), 0);
+        hmi_ui_set_motor_unavailable();
+        hmi_ui_set_overspeed_unknown();
         bsp_display_unlock();
         return;
     }
 
-    ESP_LOGI(TAG, "Motor status: on=%u speed=%u RPM temp=%u C overspeed=%u",
+    ESP_LOGI(TAG, "Motor status: on=%u speed=%u RPM temp=%u C overspeed=%u setpoint=%u RPM",
              (unsigned)motor_on,
              (unsigned)current_speed,
              (unsigned)temperature,
-             (unsigned)overspeed_alarm);
+             (unsigned)overspeed_alarm,
+             (unsigned)speed_setpoint);
 
     bsp_display_lock(0);
-    lv_label_set_text_fmt(s_motor_status_label,
-                          "ACTUAL SPEED: %u RPM\nMOTOR TEMPERATURE: %u C",
-                          (unsigned)current_speed, (unsigned)temperature);
-    lv_label_set_text(s_overspeed_label,
-                      overspeed_alarm ? "OVERSPEED ALARM: ACTIVE" : "OVERSPEED ALARM: CLEAR");
-    lv_obj_set_style_bg_color(s_overspeed_label,
-                              lv_color_hex(overspeed_alarm ? 0xC62828 : 0x168A45), 0);
+    hmi_ui_set_motor_status(current_speed, temperature);
+    hmi_ui_set_overspeed(overspeed_alarm != 0);
+    if (init) {
+        hmi_ui_set_target_speed(speed_setpoint);
+    }
     bsp_display_unlock();
 }
 
@@ -244,22 +285,92 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting BIST HMI");
 
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    uint32_t causes = esp_sleep_get_wakeup_causes();
+    if (!(causes & BIT(ESP_SLEEP_WAKEUP_ULP))) {
+        ESP_LOGI(TAG, "Not an LP core wakeup. Causes = 0x%" PRIx32, causes);
+        ESP_LOGI(TAG, "Initializing...");
+
+        lp_uart_init();
+        lp_core_init();
+    }
+
+    /* Give the LP companion time to initialize the software mailbox first. */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /*
+     * Start agent + status task before display/Modbus. Companion AGENT_READY
+     * timeout is short; the worker must be live before post-boot LP_STATUS
+     * so it can ACK with AGENT_POSTBOOT_DONE.
+     */
+    int agent_err = bist_hd_agent_start();
+    if (agent_err != 0) {
+        ESP_LOGE(TAG, "Failed to start Host Diagnostic Agent: %d", agent_err);
+        ESP_ERROR_CHECK(ESP_FAIL);
+    }
+    ESP_LOGI(TAG, "Host Diagnostic Agent started");
+
+    BaseType_t task_ok = xTaskCreate(bist_status_task, "bist_status", 4096, NULL,
+                                     configMAX_PRIORITIES - 2, NULL);
+    ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+
+    /* Wait for the post-boot result before enabling motor control. */
+
+    while (!s_bist_post_boot_done) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    /* Initialize the display after the post-boot handshake completes. */
+    ESP_ERROR_CHECK(display_init());
+
+    if (!s_bist_post_boot_ok) {
+        ESP_LOGE(TAG, "Post-boot BIST failed");
+        return;
+    }
+
     s_command_queue = xQueueCreate(8, sizeof(motor_command_t));
     ESP_ERROR_CHECK(s_command_queue ? ESP_OK : ESP_ERR_NO_MEM);
 
-    ESP_ERROR_CHECK(display_init());
+    /* Start the Modbus master. */
+
     ESP_ERROR_CHECK(master_init());
 
+    update_motor_status(true);
+    update_bist_postboot_status();
+
+    bool runtime_rendered = false;
+    bool safe_state_entered = false;
+    bool last_runtime_ok = false;
     TickType_t last_status_update = 0;
     for (;;) {
+        /* Reflect the latest runtime BIST status produced by the status task. */
+        if (!runtime_rendered || s_bist_runtime_ok != last_runtime_ok) {
+            last_runtime_ok = s_bist_runtime_ok;
+            runtime_rendered = true;
+            update_bist_runtime_status();
+        }
+
+        if (s_hmi_halted) {
+            if (!safe_state_entered) {
+                enter_hmi_safe_state();
+                safe_state_entered = true;
+            }
+            /* Agent worker keeps the LP mailbox drained; idle the UI here. */
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         motor_command_t command;
-        if (xQueueReceive(s_command_queue, &command, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (xQueueReceive(s_command_queue, &command, 0) == pdTRUE) {
             execute_motor_command(&command);
         }
 
         if (xTaskGetTickCount() - last_status_update >= pdMS_TO_TICKS(1000)) {
-            update_motor_status();
+            update_motor_status(false);
             last_status_update = xTaskGetTickCount();
         }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }

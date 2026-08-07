@@ -3,6 +3,7 @@ __pycache__/
 
 # esp-idf built binaries
 build/
+build-*/
 build_*_*/
 sdkconfig
 sdkconfig.old
