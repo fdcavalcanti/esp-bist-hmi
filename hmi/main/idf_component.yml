@@ -1,0 +1,11 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf:
+    version: '>=5.4.0'
+  espressif/m5stack_tab5: ^1.2.0
+overrides:
+- usb:
+    with:
+      usb:
+        path: ../../../esp-idf/components/usb
+    reason: Use IDF 5.4.2 built-in USB instead of managed espressif/usb 1.4.x
