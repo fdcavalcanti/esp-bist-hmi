@@ -1,4 +1,4 @@
-menu "Modbus Example Configuration"
+menu "Motor Controller Modbus"
 
     config MB_UART_PORT_ONE
         bool
@@ -17,14 +17,14 @@ menu "Modbus Example Configuration"
         range 0 1 if MB_UART_PORT_ONE
         default 1 if MB_UART_PORT_ONE
         help
-            UART communication port number for Modbus example.
+            UART communication port number for the motor controller Modbus slave.
 
     config MB_UART_BAUD_RATE
         int "UART communication speed"
         range 1200 115200
         default 115200
         help
-            UART communication speed for Modbus example.
+            UART communication speed for the motor controller Modbus slave.
 
     config MB_UART_RXD
         int "UART RXD pin number"

@@ -1,30 +1,43 @@
 # BIST HMI
 
-HMI demonstration on an **M5Stack Tab5** (ESP32-P4) that talks to a simulated motor controller over **Modbus RTU / RS-485**. The long-term goal is to run **ESP-BIST** on the Tab5 and show a safe industrial-style HMI on an Espressif SoC.
+HMI demonstration on an **M5Stack Tab5** (ESP32-P4) that runs **ESP-BIST** Host Diagnostics on the LP core and talks to a simulated motor controller over **Modbus RTU / RS-485**.
 
 ## Overview
 
 | Role | Hardware | Firmware |
 |------|----------|----------|
-| Modbus master + touch HMI | M5Stack Tab5 (ESP32-P4) | [`hmi/`](hmi/) |
+| Modbus master + touch HMI + BIST agent | M5Stack Tab5 (ESP32-P4) | [`hmi/`](hmi/) |
 | Simulated motor controller (Modbus slave) | Separate ESP board + RS-485 transceiver | [`modbus_motor_controller/`](modbus_motor_controller/) |
 
 ```
 ┌─────────────────────┐         RS-485          ┌──────────────────────────┐
 │  M5Stack Tab5       │◄───────────────────────►│  ESP motor controller    │
 │  (Modbus master)    │      A / B + GND        │  (Modbus slave, addr 1)  │
-│  LVGL touch UI      │                         │  Simulated drive params  │
+│  LVGL + ESP-BIST    │                         │  Simulated drive params  │
 └─────────────────────┘                         └──────────────────────────┘
 ```
 
 Shared register definitions live in [`shared/modbus_common/`](shared/modbus_common/).
 
-## Repository layout
+## Workspace layout
+
+This project expects a sibling **esp-bist** checkout (paths in `hmi/CMakeLists.txt` and `hmi/main/ulp/CMakeLists.txt`):
+
+```
+esp_m5_workspace/          # or any parent folder
+├── bist_hmi/              # this repository
+├── esp-bist/              # required sibling
+└── esp-idf-v6.0/          # ESP-IDF 6.0 (or export IDF_PATH)
+```
 
 ```
 bist_hmi/
-├── hmi/                          # Tab5 HMI (Modbus master + LVGL UI)
-│   ├── main/                     # bist_hmi.c, Tab5 display bring-up
+├── hmi/                          # Tab5 HMI (BIST + Modbus master + LVGL)
+│   ├── main/
+│   │   ├── bist_hmi.c            # app_main: HD agent, UI, Modbus loop
+│   │   ├── hmi_ui.c / .h         # LVGL motor + BIST status UI
+│   │   ├── tab5_display.c / .h   # panel detect (ILI9881C / ST7123 / ST7121)
+│   │   └── ulp/                  # LP companion (ESP-BIST Host Diagnostics)
 │   └── components/
 │       └── modbus_bist_master/   # Serial Modbus master API
 ├── modbus_motor_controller/      # Simulated motor controller (Modbus slave)
@@ -32,24 +45,13 @@ bist_hmi/
     └── modbus_common/            # Shared coil / register map
 ```
 
-## Current status
-
-**Working today**
-
-- Tab5 LVGL UI: motor ON/OFF, target speed (±100 RPM), live speed / temperature / overspeed
-- Modbus RTU master on the Tab5 (`modbus_bist_master`)
-- Simulated motor controller slave on a second ESP over RS-485
-
-**Planned**
-
-- Integrate **ESP-BIST** on the Tab5
-- Drive the on-screen **BIST STATUS** from real BIST results (UI placeholder: `BIST STATUS: NOT READY`)
-
 ## Requirements
 
-- [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) **≥ 5.4** (HMI targets ESP32-P4 / Tab5)
+- [ESP-IDF](https://docs.espressif.com/projects/esp-idf/) **6.0** (pinned in component manifests)
+- Sibling [esp-bist](https://github.com/espressif/esp-bist) checkout (see layout above)
+- ULP custom linker patch applied to your IDF install (see below)
 - M5Stack Tab5
-- Second ESP board for the motor controller slave (any target supported by that project)
+- Second ESP board for the motor controller slave
 - RS-485 transceivers (e.g. MAX485) on both ends, common GND
 
 ## Hardware / RS-485
@@ -82,7 +84,7 @@ Tab5 / ESP          |               |   RS-485 side |               |    Other E
 | Baud | 115200 |
 | Mode | RTU |
 
-Configure the motor controller UART pins in `idf.py menuconfig` → **Modbus Example Configuration** so they match your board and transceiver.
+Configure the motor controller UART pins in `idf.py menuconfig` → **Motor Controller Modbus** so they match your board and transceiver.
 
 ## Modbus register map
 
@@ -101,26 +103,54 @@ Slave address defaults to **1**. Communication mode and baud must match on maste
 
 ## Build and flash
 
+### 0. One-time setup
+
+```bash
+# Clone esp-bist next to this repo if needed
+# git clone https://github.com/espressif/esp-bist.git
+
+# Export ESP-IDF 6.0
+. "$IDF_PATH/export.sh"
+
+# Apply the ULP custom linker patch (required for ESP-BIST LP builds)
+cd "$IDF_PATH"
+git apply /path/to/esp-bist/samples/idf/patches/idf_ulp_linker.patch
+```
+
+The patch adds `ulp_apply_custom_linker_script()`, which the HMI ULP project uses instead of the stock LP linker script.
+
 ### 1. Simulated motor controller
 
 ```bash
-cd modbus_motor_controller
-idf.py set-target <your-esp-target>
-idf.py menuconfig   # set UART TX/RX/RTS for your RS-485 wiring
+cd bist_hmi/modbus_motor_controller
+idf.py set-target <your-esp-target>   # e.g. esp32s3
+idf.py menuconfig                     # Motor Controller Modbus → UART TX/RX/RTS
 idf.py -p PORT flash monitor
 ```
 
-See [`modbus_motor_controller/README.md`](modbus_motor_controller/README.md) for slave details.
+Defaults: RTU, 115200, slave address **1**. See [`modbus_motor_controller/README.md`](modbus_motor_controller/README.md).
 
 ### 2. Tab5 HMI
 
 ```bash
-cd hmi
+cd bist_hmi/hmi
 idf.py set-target esp32p4
 idf.py -p PORT flash monitor
 ```
 
-Component dependencies (Tab5 BSP, display) are pulled via the IDF Component Manager (`hmi/main/idf_component.yml`).
+Notes:
 
-Modbus master API details: [`hmi/components/modbus_bist_master/README.md`](hmi/components/modbus_bist_master/README.md).
+- First build pulls managed components (`m5stack_tab5`, `esp_lvgl_port` 2.9.0, `esp_lcd_st7121`).
+- On IDF 6.0, `hmi/CMakeLists.txt` applies a small `esp_lvgl_port` MIPI DSI compatibility patch automatically.
+- Console is **USB Serial/JTAG** — use the Tab5 USB-Serial/JTAG port.
+- Tab5 flash / SPIRAM / P4 revision defaults are in `hmi/sdkconfig.defaults`.
 
+More detail: [`hmi/README.md`](hmi/README.md).  
+Modbus master API: [`hmi/components/modbus_bist_master/README.md`](hmi/components/modbus_bist_master/README.md).
+
+## Runtime behaviour
+
+1. LP companion starts; HP Host Diagnostic Agent waits for post-boot BIST.
+2. Display comes up after post-boot completes. If post-boot fails, motor control does not start.
+3. Modbus master polls the slave and drives the UI.
+4. On runtime BIST failure, the HMI cuts motor power and shows a halted state.

@@ -140,10 +140,8 @@ mb_exception_t my_custom_fc_handler(void *inst, uint8_t *frame_ptr, uint16_t *le
     return MB_EX_NONE; // Set the exception code for modbus object appropriately
 }
 
-// An example application of Modbus slave. It is based on esp-modbus stack.
-// See deviceparams.h file for more information about assigned Modbus parameters.
-// These parameters can be accessed from main application and also can be changed
-// by external Modbus master host.
+// Simulated motor-controller Modbus slave for the BIST HMI demo.
+// Register layout: shared/modbus_common (motor_controller_params.h).
 void app_main(void)
 {
     mb_param_info_t reg_info; // keeps the Modbus registers access information
@@ -244,8 +242,8 @@ void app_main(void)
     ESP_ERROR_CHECK(task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
 #if CONFIG_FMB_CONTROLLER_SLAVE_ID_SUPPORT
-    // Initialize the new slave identificator structure (example)
-    INIT_DEV_ID(new_id_struct, 0x00, 0x00, 0x11223344, "esp_modbus_serial_slave");
+    // Slave identification structure for report-slave-ID (optional).
+    INIT_DEV_ID(new_id_struct, 0x00, 0x00, 0x11223344, "bist_hmi_motor_controller");
     uint8_t is_running = (bool)(err == ESP_OK);
 
     // This is the way to set Slave ID fields to retrieve it by master using report slave ID command.

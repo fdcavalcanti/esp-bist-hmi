@@ -1,10 +1,28 @@
-# Modbus Example Common
+# modbus_common
 
-This directory contains component that is common for Modbus master and slave examples. The component defines Modbus parameters that are shared between examples and provide code that you can copy and adapt into your own projects.
-For more information please refer to Modbus example README.md files located in the folders:
+Shared Modbus parameter structures for the BIST HMI demo. Both the Tab5 master and the motor-controller slave use this map so coil / register layouts stay in sync.
 
-* `examples/protocols/modbus/serial/mb_master` Modbus serial master implementation (RTU and ASCII)
-* `examples/protocols/modbus/serial/mb_slave` Modbus serial slave implementation (RTU and ASCII)
-* `examples/protocols/modbus/serial/mb_master` Modbus serial master implementation (RTU and ASCII)
-* `examples/protocols/modbus/tcp/mb_tcp_slave` Modbus serial slave implementation (TCP)
-* `examples/protocols/modbus/tcp/mb_tcp_master` Modbus serial master implementation (TCP)
+## Files
+
+| File | Role |
+|------|------|
+| `include/motor_controller_params.h` | Coil, discrete, holding, and input register structs |
+| `modbus_params.c` | Zero-initialized storage instances |
+
+## Register map
+
+| Type | Field | Meaning |
+|------|-------|---------|
+| Coil | `motor_on_off` | Motor power |
+| Discrete | `overspeed_alarm` | Overspeed alarm |
+| Holding | `motor_speed_setpoint` | Target speed (RPM) |
+| Holding | `critical_speed` | Critical speed threshold |
+| Input | `motor_current_speed` | Actual speed (RPM) |
+| Input | `motor_temperature` | Temperature (°C) |
+
+## How it is pulled in
+
+Path dependencies in Component Manager manifests:
+
+- `hmi/components/modbus_bist_master/idf_component.yml` → `../../../shared/modbus_common`
+- `modbus_motor_controller/main/idf_component.yml` → `../../shared/modbus_common`

@@ -3,6 +3,9 @@
 Serial Modbus master for the Tab5 HMI. Talks to `modbus_motor_controller`
 using the shared register map in `shared/modbus_common`.
 
+This repo pins ESP-IDF **6.0** for the HMI application; the component itself
+depends on `espressif/esp-modbus` ^2.
+
 ## Public API (`serial_master.h`)
 
 | Function | Purpose |
@@ -28,4 +31,5 @@ ESP_ERROR_CHECK(master_write_u8(CID_MOTOR_ON_OFF, 1));
 ESP_ERROR_CHECK(master_write_u16(CID_MOTOR_SPEED_SETPOINT, 1000));
 ```
 
-UART port, baud, and pins are configured under **Modbus Master Configuration** in `menuconfig`.
+UART port, baud, and pins are configured under **Modbus Master Configuration**
+in `menuconfig` (defaults for Tab5 are in `hmi/sdkconfig.defaults`).
